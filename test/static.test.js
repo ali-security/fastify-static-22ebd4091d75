@@ -1444,7 +1444,10 @@ test('with fastify-compress', async t => {
   const pluginOptions = {
     root: path.join(__dirname, '/static')
   }
-  const fastify = Fastify()
+  // the subtests below assert on headers only and never read the response body, so the
+  // keep-alive socket still holds an in-flight compressed body and is never 'idle';
+  // forceCloseConnections: true makes fastify.close() resolve deterministically (macOS hang)
+  const fastify = Fastify({ forceCloseConnections: true })
   fastify.register(compress, { threshold: 0 })
   fastify.register(fastifyStatic, pluginOptions)
 
