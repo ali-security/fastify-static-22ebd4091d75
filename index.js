@@ -13,6 +13,11 @@ const dirList = require('./lib/dirList')
 
 const endForwardSlashRegex = /\/$/u
 const asteriskRegex = /\*/gu
+const dotDotSegmentRegex = /(?:^|[\\/])\.\.(?:[\\/]|$)/u
+const leadingDotDotSegmentRegex = /^\/?\.\.(?:[\\/]|$)/u
+// Same as `dotDotSegmentRegex`, but matched against a raw request url, where
+// both the dots and the separators may still be percent-encoded.
+const encodedDotDotSegmentRegex = /(?:^|[\\/]|%2f|%5c)(?:\.|%2e)(?:\.|%2e)(?:[\\/]|%2f|%5c|$)/iu
 
 const supportedEncodings = ['br', 'gzip', 'deflate']
 send.mime.default_type = 'application/octet-stream'
@@ -122,7 +127,13 @@ async function fastifyStatic (fastify, opts) {
         method: ['HEAD', 'GET'],
         path: prefix + '*',
         handler (req, reply) {
-          pumpSendToReply(req, reply, '/' + req.params['*'], sendOptions.root)
+          const pathname = '/' + req.params['*']
+
+          if (hasForbiddenDotDotSegment(req.raw.url, pathname)) {
+            return reply.send(forbiddenPathError())
+          }
+
+          pumpSendToReply(req, reply, pathname, sendOptions.root)
         }
       })
       if (opts.redirect === true && prefix !== opts.prefix) {
@@ -205,6 +216,12 @@ async function fastifyStatic (fastify, opts) {
       }
     } else if (path.isAbsolute(pathname) === false) {
       return reply.callNotFound()
+    }
+
+    // @fastify/send rejects leading ".." segments, but it normalizes
+    // non-leading ones away before its guard runs.
+    if (dotDotSegmentRegex.test(pathname) && !leadingDotDotSegmentRegex.test(pathname)) {
+      return reply.send(forbiddenPathError())
     }
 
     if (allowedPath && !allowedPath(pathname, options.root, request)) {
@@ -401,6 +418,11 @@ async function fastifyStatic (fastify, opts) {
   /** @type {import("fastify").RouteHandlerMethod} */
   async function serveFileHandler (req, reply) {
     const routeConfig = req.routeOptions?.config
+
+    if (hasForbiddenDotDotSegment(req.raw.url, routeConfig.file)) {
+      return reply.send(forbiddenPathError())
+    }
+
     return pumpSendToReply(req, reply, routeConfig.file, routeConfig.rootPath)
   }
 }
@@ -507,6 +529,31 @@ function getContentType (path) {
     return type
   }
   return `${type}; charset=utf-8`
+}
+
+/**
+ * @returns {Error & { status?: number, statusCode?: number }}
+ */
+function forbiddenPathError () {
+  const error = new Error('Forbidden')
+  error.status = 403
+  error.statusCode = 403
+  return error
+}
+
+/**
+ * A route param can consume a dot-dot segment before the remaining pathname is
+ * handed over to @fastify/send, so the whole request path has to be checked
+ * and not only the part of it that ends up being resolved against the root.
+ * @param {string} url the raw request url
+ * @param {string} pathname the pathname handed over to @fastify/send
+ * @returns {boolean}
+ */
+function hasForbiddenDotDotSegment (url, pathname) {
+  const questionMark = url.indexOf('?')
+  const urlPathname = questionMark === -1 ? url : url.slice(0, questionMark)
+
+  return encodedDotDotSegmentRegex.test(urlPathname) && !leadingDotDotSegmentRegex.test(pathname)
 }
 
 /**
