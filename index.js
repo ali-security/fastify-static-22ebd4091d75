@@ -12,6 +12,7 @@ const contentDisposition = require('content-disposition')
 const dirList = require('./lib/dirList')
 
 const endForwardSlashRegex = /\/$/u
+const endAsteriskRegex = /\*$/u
 const asteriskRegex = /\*/gu
 const dotDotSegmentRegex = /(?:^|[\\/])\.\.(?:[\\/]|$)/u
 const leadingDotDotSegmentRegex = /^\/?\.\.(?:[\\/]|$)/u
@@ -122,12 +123,19 @@ async function fastifyStatic (fastify, opts) {
       throw new TypeError('"wildcard" option must be a boolean')
     }
     if (opts.wildcard === undefined || opts.wildcard === true) {
+      let matchRoutePrefix
+
       fastify.route({
         ...routeOpts,
         method: ['HEAD', 'GET'],
         path: prefix + '*',
         handler (req, reply) {
-          const pathname = '/' + req.params['*']
+          matchRoutePrefix ??= createRoutePrefixMatcher(req.routeOptions.url)
+
+          const pathname = getPathnameForSend(req.raw.url, matchRoutePrefix)
+          if (!pathname) {
+            return reply.callNotFound()
+          }
 
           if (hasForbiddenDotDotSegment(req.raw.url, pathname)) {
             return reply.send(forbiddenPathError())
@@ -613,6 +621,133 @@ function getEncodingHeader (headers, checked) {
     header,
     supportedEncodings.filter((enc) => !checked.has(enc))
   )
+}
+
+/**
+ * @param {string} routePrefix
+ * @returns {Array<string|undefined>}
+ */
+function createRoutePrefixTokens (routePrefix) {
+  const tokens = []
+  let routeIndex = 0
+  let segmentStart = 0
+
+  while (routeIndex < routePrefix.length) {
+    if (routePrefix[routeIndex] !== ':') {
+      routeIndex++
+      continue
+    }
+
+    if (segmentStart !== routeIndex) {
+      tokens.push(routePrefix.slice(segmentStart, routeIndex))
+    }
+
+    routeIndex++
+    while (routeIndex < routePrefix.length && routePrefix[routeIndex] !== '/') {
+      routeIndex++
+    }
+
+    tokens.push(undefined)
+    segmentStart = routeIndex
+  }
+
+  if (segmentStart !== routePrefix.length) {
+    tokens.push(routePrefix.slice(segmentStart))
+  }
+
+  return tokens
+}
+
+/**
+ * @param {string} pathname
+ * @param {number} pathnameEnd
+ * @param {Array<string|undefined>} tokens
+ * @returns {number|undefined}
+ */
+function getRoutePrefixMatchLength (pathname, pathnameEnd, tokens) {
+  let pathnameIndex = 0
+
+  for (const token of tokens) {
+    if (token === undefined) {
+      const segmentStart = pathnameIndex
+      const slashIndex = pathname.indexOf('/', pathnameIndex)
+
+      pathnameIndex = slashIndex === -1 || slashIndex > pathnameEnd
+        ? pathnameEnd
+        : slashIndex
+
+      if (pathnameIndex === segmentStart) {
+        return
+      }
+
+      continue
+    }
+
+    const tokenEnd = pathnameIndex + token.length
+    if (tokenEnd > pathnameEnd || !pathname.startsWith(token, pathnameIndex)) {
+      return
+    }
+
+    pathnameIndex = tokenEnd
+  }
+
+  return pathnameIndex
+}
+
+/**
+ * @param {string} route
+ * @returns {(pathname: string, pathnameEnd: number) => number|undefined}
+ */
+function createRoutePrefixMatcher (route) {
+  const routePrefix = route.replace(endAsteriskRegex, '')
+  const routePrefixLength = routePrefix.length
+
+  if (routePrefix === '/') {
+    return () => 0
+  }
+
+  if (routePrefix.includes(':') === false) {
+    return (pathname, pathnameEnd) => routePrefixLength <= pathnameEnd && pathname.startsWith(routePrefix)
+      ? routePrefixLength
+      : undefined
+  }
+
+  const tokens = createRoutePrefixTokens(routePrefix)
+  return (pathname, pathnameEnd) => getRoutePrefixMatchLength(pathname, pathnameEnd, tokens)
+}
+
+/**
+ * The wildcard route param is already percent-decoded by the router, so an
+ * encoded path separator (`%2F`) would silently turn into a real separator and
+ * escape the guards of any route registered above this plugin. Derive the
+ * pathname from the raw url instead and only `decodeURI` it, which leaves the
+ * reserved characters — the separators included — encoded.
+ * @param {string} url
+ * @param {(pathname: string, pathnameEnd: number) => number|undefined} matchRoutePrefix
+ * @returns {string|undefined}
+ */
+function getPathnameForSend (url, matchRoutePrefix) {
+  const questionMark = url.indexOf('?')
+  const pathnameEnd = questionMark === -1 ? url.length : questionMark
+
+  const prefixLength = matchRoutePrefix(url, pathnameEnd)
+  if (prefixLength === undefined) {
+    return
+  }
+
+  let pathname = url.slice(prefixLength, pathnameEnd)
+
+  if (pathname === '') {
+    pathname = '/'
+  } else if (!pathname.startsWith('/')) {
+    pathname = '/' + pathname
+  }
+
+  try {
+    return decodeURI(pathname)
+  } catch {
+
+  }
 }
 
 /**
